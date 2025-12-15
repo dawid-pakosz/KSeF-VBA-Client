@@ -1,0 +1,336 @@
+
+Option Explicit
+
+' -----------------------------------------------------------------------------
+' KSeF API Wrapper (API v2.0)
+' Handles Authentication (Token), Session Opening (AES Key Exchange), Invoice Sending.
+' -----------------------------------------------------------------------------
+
+' Configuration Constants
+Public Const KSEF_URL_TEST As String = "https://ksef-test.mf.gov.pl/api/v2"
+Public Const KSEF_URL_DEMO As String = "https://ksef-demo.mf.gov.pl/api/v2"
+Public Const KSEF_URL_PROD As String = "https://ksef.mf.gov.pl/api/v2"
+
+Private m_sUrl As String
+Private m_sToken As String
+Private m_sAuthToken As String ' The auth token used for Bearer Header
+Private m_sNip As String
+
+' Persistent HTTP Object for Cookie/Session management (Critical for WAF)
+Private m_http As Object
+
+' -----------------------------------------------------------------------------
+' Setup
+' -----------------------------------------------------------------------------
+Public Sub Setup(ByVal sUrl As String, ByVal sNip As String, ByVal sToken As String)
+    m_sUrl = sUrl
+    m_sNip = sNip
+    m_sToken = sToken
+    
+    ' Initialize HTTP Object ONCE to preserve Cookies/Session
+    ' Reverting to WinHttp.WinHttpRequest.5.1 often works better if configured correctly
+    ' and avoids MSXML2 quirks.
+    Set m_http = CreateObject("WinHttp.WinHttpRequest.5.1")
+    
+    ' Force TLS 1.2
+    On Error Resume Next
+    m_http.Option(9) = 2048 ' SecureProtocols = TLS 1.2
+    On Error GoTo 0
+    
+    ' Optional timeouts (Resolve, Connect, Send, Receive) - values in ms
+    ' m_http.setTimeouts 5000, 5000, 10000, 30000
+End Sub
+
+Public Sub SetSessionToken(ByVal sAuthToken As String)
+    m_sAuthToken = sAuthToken
+End Sub
+
+' -----------------------------------------------------------------------------
+' Api_Login
+' Returns: AuthToken
+' Out: AuthReferenceNumber
+' -----------------------------------------------------------------------------
+Public Function Api_Login(ByRef outRefNum As String) As String
+    ' 1. Authorisation Challenge
+    Dim sResp As String
+    Dim jsonResp As Object
+    
+    sResp = CallApi("POST", "/auth/challenge", _
+            "{""contextIdentifier"": {""type"": ""Nip"", ""value"": """ & m_sNip & """}}")
+            
+    Set jsonResp = ModJson.JsonParse(sResp)
+    Dim sChallenge As String
+    Dim sTimestamp As String
+    sChallenge = jsonResp("challenge")
+    sTimestamp = jsonResp("timestamp")
+    
+    ' 2. Prepare Token
+    Dim sTimeMillis As String
+    sTimeMillis = ParseIsoToMillis(sTimestamp)
+    Dim sRawToken As String
+    sRawToken = m_sToken & "|" & sTimeMillis
+    
+    ' 3. Encrypt Token
+    Dim sCertDer As String
+    sCertDer = GetPublicKey(m_sUrl, "KsefTokenEncryption")
+    Dim abCert() As Byte
+    abCert = ModBase64.DecodeStringToByte(sCertDer)
+    Dim sEncryptedToken As String
+    sEncryptedToken = ModCrypto.EncryptToken(sRawToken, abCert)
+    
+    ' 4. InitToken
+    Dim dictBody As Object
+    Set dictBody = CreateObject("Scripting.Dictionary")
+    
+    Dim dictContext As Object
+    Set dictContext = CreateObject("Scripting.Dictionary")
+    dictContext.Add "type", "Nip"
+    dictContext.Add "value", m_sNip
+    
+    dictBody.Add "contextIdentifier", dictContext
+    dictBody.Add "challenge", sChallenge
+    dictBody.Add "encryptedToken", sEncryptedToken
+    
+    Dim body As String
+    body = ModJson.JsonDump(dictBody)
+    
+    sResp = CallApi("POST", "/auth/ksef-token", body)
+    Set jsonResp = ModJson.JsonParse(sResp)
+    
+    m_sAuthToken = jsonResp("authenticationToken")("token")
+    outRefNum = jsonResp("referenceNumber")
+    
+    Api_Login = m_sAuthToken
+End Function
+
+' -----------------------------------------------------------------------------
+' Api_OpenSession
+' Generates AES Key, Encrypts with RSA, Opens Session.
+' Returns: SessionReferenceNumber
+' Out: Base64 AES Key and IV (to be stored for sending invoices)
+' -----------------------------------------------------------------------------
+Public Function Api_OpenSession(ByRef outAesKey As String, ByRef outAesIV As String) As String
+    ' 1. Generate AES Key (32 bytes) and IV (16 bytes)
+    Dim abAesKey() As Byte
+    abAesKey = ModCrypto.GenerateRandomBytes(32)
+    Dim abIV() As Byte
+    abIV = ModCrypto.GenerateRandomBytes(16)
+    
+    outAesKey = ModBase64.EncodeByteToString(abAesKey)
+    outAesIV = ModBase64.EncodeByteToString(abIV)
+    
+    ' 2. Encrypt AES Key with KSeF Public Key (RSA)
+    Dim sCertDer As String
+    sCertDer = GetPublicKey(m_sUrl, "SymmetricKeyEncryption")
+    
+    Dim abCert() As Byte
+    abCert = ModBase64.DecodeStringToByte(sCertDer)
+    
+    Dim sEncryptedKey As String
+    sEncryptedKey = ModCrypto.RsaEncryptBytes(abAesKey, abCert)
+    
+    ' 3. Prepare Body
+    Dim dictBody As Object
+    Set dictBody = CreateObject("Scripting.Dictionary")
+    
+    ' STRICT ALIGNMENT WITH PYTHON t-20-add-fv.py:
+    ' No "context" node in body.
+    
+    Dim dictFormCode As Object
+    Set dictFormCode = CreateObject("Scripting.Dictionary")
+    dictFormCode.Add "systemCode", "FA (3)"
+    dictFormCode.Add "schemaVersion", "1-0E"
+    dictFormCode.Add "value", "FA"
+    dictBody.Add "formCode", dictFormCode
+    
+    Dim dictEncryption As Object
+    Set dictEncryption = CreateObject("Scripting.Dictionary")
+    dictEncryption.Add "encryptedSymmetricKey", sEncryptedKey
+    dictEncryption.Add "initializationVector", outAesIV
+    dictBody.Add "encryption", dictEncryption
+    
+    ' 4. Call /sessions/online
+    Dim sResp As String
+    Dim jsonResp As Object
+    sResp = CallApi("POST", "/sessions/online", ModJson.JsonDump(dictBody))
+    
+    Set jsonResp = ModJson.JsonParse(sResp)
+    Api_OpenSession = jsonResp("referenceNumber")
+End Function
+
+' -----------------------------------------------------------------------------
+' Api_SendInvoice
+' Encrypts Invoice with AES Key and sends it.
+' -----------------------------------------------------------------------------
+Public Function Api_SendInvoice(ByVal sSessionRef As String, ByVal sXmlContent As String, ByVal sAesKeyB64 As String, ByVal sAesIVB64 As String) As String
+    
+    ' 1. Prepare Keys
+    Dim abAesKey() As Byte
+    abAesKey = ModBase64.DecodeStringToByte(sAesKeyB64)
+    Dim abIV() As Byte
+    abIV = ModBase64.DecodeStringToByte(sAesIVB64)
+    Dim abXml() As Byte
+    abXml = ModBase64.Utf8BytesFromString(sXmlContent)
+    
+    Dim lOrigSize As Long
+    lOrigSize = UBound(abXml) + 1
+    
+    ' 2. Calculate Hash of Plain
+    Dim abHash() As Byte
+    abHash = ModCrypto.Sha256(abXml)
+    Dim sHashBase64 As String
+    sHashBase64 = ModBase64.EncodeByteToString(abHash)
+    
+    ' 3. Encrypt Invoice (AES)
+    Dim abEncrypted() As Byte
+    abEncrypted = ModCrypto.AesEncrypt(abXml, abAesKey, abIV)
+    
+    Dim sEncryptedContentB64 As String
+    sEncryptedContentB64 = ModBase64.EncodeByteToString(abEncrypted)
+    
+    Dim lEncSize As Long
+    lEncSize = UBound(abEncrypted) + 1
+    
+    ' 4. Calculate Hash of Encrypted
+    Dim abEncHash() As Byte
+    abEncHash = ModCrypto.Sha256(abEncrypted)
+    Dim sEncHashBase64 As String
+    sEncHashBase64 = ModBase64.EncodeByteToString(abEncHash)
+    
+    ' 5. Prepare Body
+    Dim dictBody As Object
+    Set dictBody = CreateObject("Scripting.Dictionary")
+    
+    ' invoiceHash
+    Dim dictHash As Object
+    Set dictHash = CreateObject("Scripting.Dictionary")
+    Dim dictHashDetails As Object
+    Set dictHashDetails = CreateObject("Scripting.Dictionary")
+    dictHashDetails.Add "algorithm", "SHA-256"
+    dictHashDetails.Add "encoding", "Base64"
+    dictHashDetails.Add "value", sHashBase64
+    dictHash.Add "hashSHA", dictHashDetails
+    dictBody.Add "invoiceHash", dictHash
+    
+    dictBody.Add "invoiceSize", lOrigSize
+    
+    ' encryptedInvoiceHash
+    Dim dictEncHash As Object
+    Set dictEncHash = CreateObject("Scripting.Dictionary")
+    Dim dictEncHashDetails As Object
+    Set dictEncHashDetails = CreateObject("Scripting.Dictionary")
+    dictEncHashDetails.Add "algorithm", "SHA-256"
+    dictEncHashDetails.Add "encoding", "Base64"
+    dictEncHashDetails.Add "value", sEncHashBase64
+    dictEncHash.Add "hashSHA", dictEncHashDetails
+    dictBody.Add "encryptedInvoiceHash", dictEncHash
+    
+    dictBody.Add "encryptedInvoiceSize", lEncSize
+    dictBody.Add "encryptedInvoiceContent", sEncryptedContentB64
+    dictBody.Add "offlineMode", False
+    
+    ' 6. Send
+    Dim sResp As String
+    Dim jsonResp As Object
+    
+    sResp = CallApi("POST", "/sessions/online/" & sSessionRef & "/invoices", ModJson.JsonDump(dictBody))
+    
+    Set jsonResp = ModJson.JsonParse(sResp)
+    Api_SendInvoice = jsonResp("elementReferenceNumber")
+End Function
+
+' -----------------------------------------------------------------------------
+' GetPublicKey
+' Usage: "KsefTokenEncryption" or "SymmetricKeyEncryption"
+' -----------------------------------------------------------------------------
+Private Function GetPublicKey(ByVal sUrl As String, ByVal sUsage As String) As String
+    Dim sResp As String
+    sResp = CallApi("GET", "/security/public-key-certificates", "")
+    
+    Dim colCerts As Collection
+    Set colCerts = ModJson.JsonParse(sResp)
+    
+    Dim certObj As Object
+    Dim usageColl As Collection
+    Dim usageItem As Variant
+    Dim sFoundCert As String
+    
+    For Each certObj In colCerts
+        Set usageColl = certObj("usage")
+        For Each usageItem In usageColl
+            If usageItem = sUsage Then
+                sFoundCert = certObj("certificate")
+                Exit For
+            End If
+        Next usageItem
+        If sFoundCert <> "" Then Exit For
+    Next certObj
+    
+    If sFoundCert = "" Then
+        Err.Raise vbObjectError + 4, "ModKSeF_Api", "Could not find certificate with " & sUsage & " usage."
+    End If
+    
+    GetPublicKey = sFoundCert
+End Function
+
+' -----------------------------------------------------------------------------
+' Helper: CallApi
+' Uses persistent m_http object to maintain WAF cookies
+' -----------------------------------------------------------------------------
+Private Function CallApi(ByVal sMethod As String, ByVal sEndpoint As String, ByVal sBody As String) As String
+    ' Note: m_http is initialized in Setup
+    
+    m_http.Open sMethod, m_sUrl & sEndpoint, False
+    m_http.SetRequestHeader "Content-Type", "application/json"
+    
+    ' MINIMAL HEADERS to match Python script exactly
+    ' No explicit User-Agent (let WinHttp decide or default)
+    ' No explicit Accept
+    
+    If m_sAuthToken <> "" Then
+        m_http.SetRequestHeader "Authorization", "Bearer " & m_sAuthToken
+    End If
+    
+    If sBody <> "" Then
+        m_http.Send sBody
+    Else
+        m_http.Send
+    End If
+    
+    If m_http.status >= 400 Then
+        Debug.Print "--- API ERROR ---"
+        Debug.Print "URL: " & m_sUrl & sEndpoint
+        Debug.Print "Status: " & m_http.status & " " & m_http.statusText
+        Debug.Print "Headers: " & m_http.getAllResponseHeaders()
+        Debug.Print "Body: " & m_http.responseText
+        Debug.Print "-----------------"
+        Err.Raise vbObjectError + 2, "ModKSeF_Api", "API Error " & m_http.status & ": " & m_http.responseText
+    End If
+    
+    CallApi = m_http.responseText
+End Function
+
+' -----------------------------------------------------------------------------
+' Helper: ParseIsoToMillis
+' -----------------------------------------------------------------------------
+Private Function ParseIsoToMillis(ByVal sIso As String) As String
+    Dim dDate As Date
+    Dim sMillis As String
+    
+    sIso = Replace(sIso, "Z", "")
+    Dim parts() As String
+    parts = Split(sIso, ".")
+    
+    dDate = CDate(Replace(parts(0), "T", " "))
+    If UBound(parts) > 0 Then sMillis = Left(parts(1), 3) Else sMillis = "0"
+    
+    Dim dDiff As Double
+    dDiff = (dDate - DateSerial(1970, 1, 1)) * 86400#
+    
+    Dim lTotal As Currency
+    lTotal = dDiff * 1000 + val(sMillis)
+    
+    ParseIsoToMillis = CStr(lTotal)
+End Function
+
+
