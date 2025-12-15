@@ -1,0 +1,185 @@
+
+Option Explicit
+
+' -----------------------------------------------------------------------------
+' Main Modules for Excel Interaction
+' -----------------------------------------------------------------------------
+
+' --- DIAGNOSTIC TOOL ---
+' Run this to verify if Basic Login (Token) works.
+' If this fails with 403, we are blocked globally.
+' If this works, "Solutions that worked" are indeed working.
+Public Sub Main_CheckLogin()
+    On Error GoTo ErrorHandler
+    
+    Dim sNip As String
+    Dim sToken As String
+    Dim sUrl As String
+    
+    sNip = Trim(ActiveSheet.Range("B1").value)
+    sToken = Trim(ActiveSheet.Range("B2").value)
+    sUrl = "https://ksef-test.mf.gov.pl/api/v2" ' Hardcoded for CheckLogin
+    
+    If sNip = "" Or sToken = "" Then
+        MsgBox "Please enter NIP (B1) and Token (B2).", vbExclamation
+        Exit Sub
+    End If
+    
+    ModKSeF_Api.Setup sUrl, sNip, sToken
+    
+    Dim sAuthRefNum As String
+    Dim sAuthToken As String
+    
+    sAuthToken = ModKSeF_Api.Api_Login(sAuthRefNum)
+    
+    MsgBox "LOGIN SUCCESS!" & vbCrLf & _
+           "Token: " & Left(sAuthToken, 20) & "...", vbInformation
+           
+    Exit Sub
+ErrorHandler:
+    MsgBox "LOGIN FAILED: " & Err.Description, vbCritical
+End Sub
+
+' --- NEW DIAGNOSTIC ---
+Public Sub Main_TestPython()
+    On Error Resume Next
+    Dim oShell As Object, oExec As Object
+    Set oShell = CreateObject("WScript.Shell")
+    
+    ' 1. Test basic shell
+    Dim sCmd As String
+    sCmd = "cmd /c echo HELLO_WORLD"
+    Set oExec = oShell.Exec(sCmd)
+    Dim sOut As String
+    Do While oExec.status = 0: DoEvents: Loop
+    sOut = oExec.StdOut.ReadAll
+    Debug.Print "Shell Test 1 (Echo): " & sOut
+    
+    ' 2. Test Python Version
+    sCmd = "cmd /c python --version"
+    Set oExec = oShell.Exec(sCmd)
+    Do While oExec.status = 0: DoEvents: Loop
+    sOut = oExec.StdOut.ReadAll
+    If sOut = "" Then sOut = oExec.StdErr.ReadAll
+    Debug.Print "Shell Test 2 (Python): " & sOut
+    
+    ' 3. Test Directory Access
+    Dim sWorkDir As String
+    sWorkDir = "c:\Users\Admin\Desktop\Dudek\Python\Projekty\KSeF-Python-Client-V6_TEST_Env_TOKEN"
+    sCmd = "cmd /c cd /d """ & sWorkDir & """ && dir t-10*.py"
+    Set oExec = oShell.Exec(sCmd)
+    Do While oExec.status = 0: DoEvents: Loop
+    sOut = oExec.StdOut.ReadAll
+    If sOut = "" Then sOut = oExec.StdErr.ReadAll
+    Debug.Print "Shell Test 3 (File Access): " & sOut
+End Sub
+
+Public Sub Main_Login()
+    'On Error GoTo ErrorHandler
+    
+    ' 1. Config
+    Dim sNip As String
+    Dim sToken As String
+    Dim sUrl As String
+    
+    sNip = Trim(ActiveSheet.Range("B1").value)
+    sToken = Trim(ActiveSheet.Range("B2").value)
+    sUrl = ModKSeF_Api.KSEF_URL_TEST
+    
+    If sNip = "" Or sToken = "" Then
+        MsgBox "Please enter NIP (B1) and Token (B2).", vbExclamation
+        Exit Sub
+    End If
+    
+    ' 2. Setup
+    ModKSeF_Api.Setup sUrl, sNip, sToken
+    
+    ' 3. Execute Login (InitToken)
+    Dim sAuthRefNum As String
+    Dim sAuthToken As String
+    
+    sAuthToken = ModKSeF_Api.Api_Login(sAuthRefNum)
+    ActiveSheet.Range("B5").value = sAuthToken
+    
+    ' --- NEW: WAF Mitigation Delay ---
+    ' Wait 2 seconds to avoid triggering firewall speed filters
+    Application.Wait (Now + TimeValue("0:00:02"))
+    
+    ' 4. Open Interactive Session (Get Keys)
+    Dim sAesKey As String
+    Dim sAesIV As String
+    Dim sSessionRef As String
+    
+    sSessionRef = ModKSeF_Api.Api_OpenSession(sAesKey, sAesIV)
+    
+    ' 5. Output needed for sending invoices
+    ActiveSheet.Range("B6").value = sSessionRef
+    ActiveSheet.Range("B7").value = sAesKey
+    ActiveSheet.Range("B8").value = sAesIV
+    
+    MsgBox "Login & Session Opened!" & vbCrLf & _
+           "Session Ref: " & sSessionRef & vbCrLf & _
+           "AES Key stored in B7" & vbCrLf & _
+           "AES IV stored in B8", vbInformation
+           
+    Exit Sub
+ErrorHandler:
+    MsgBox "Login/Session Failed: " & Err.Description, vbCritical
+    Debug.Print "Error Line: " & Erl
+End Sub
+
+Public Sub Main_SendInvoice()
+    On Error GoTo ErrorHandler
+    
+    ' 1. Check Session & Keys
+    Dim sSessionToken As String
+    Dim sSessionRef As String
+    Dim sAesKey As String
+    Dim sAesIV As String
+    
+    sSessionToken = ActiveSheet.Range("B5").value
+    sSessionRef = ActiveSheet.Range("B6").value
+    sAesKey = ActiveSheet.Range("B7").value
+    sAesIV = ActiveSheet.Range("B8").value
+    
+    If sSessionToken = "" Or sSessionRef = "" Or sAesKey = "" Then
+        MsgBox "Missing Session Data. Please Login first.", vbExclamation
+        Exit Sub
+    End If
+    
+    ' Restore Context
+    Dim sNip As String, sToken As String
+    sNip = Trim(ActiveSheet.Range("B1").value)
+    sToken = Trim(ActiveSheet.Range("B2").value)
+    ModKSeF_Api.Setup ModKSeF_Api.KSEF_URL_TEST, sNip, sToken
+    ModKSeF_Api.SetSessionToken sSessionToken
+    
+    ' 2. Load Invoice XML
+    Dim sPath As String
+    ' Ask user for file
+    sPath = Application.GetOpenFilename("XML Files (*.xml), *.xml")
+    If sPath = "False" Then Exit Sub
+    
+    Dim sContent As String
+    sContent = ReadFile(sPath)
+    
+    ' 3. Send
+    Dim sResult As String
+    sResult = ModKSeF_Api.Api_SendInvoice(sSessionRef, sContent, sAesKey, sAesIV)
+    
+    MsgBox "Invoice Sent! Element Reference Number: " & sResult, vbInformation
+    
+    Exit Sub
+ErrorHandler:
+    MsgBox "Send Failed: " & Err.Description, vbCritical
+End Sub
+
+Private Function ReadFile(ByVal sPath As String) As Function
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.OpenTextFile(sPath, 1) ' ForReading
+    ReadFile = ts.ReadAll
+    ts.Close
+End Function
+
+

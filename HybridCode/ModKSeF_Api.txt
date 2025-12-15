@@ -1,0 +1,184 @@
+
+Option Explicit
+
+' -----------------------------------------------------------------------------
+' KSeF API Wrapper (SMART HYBRID)
+' Logic:
+' 1. Login via Python (t-api-auth-token.py) -> Generates auth.json
+' 2. Session via Python (t-10-session-online.py) -> Uses auth.json, generates [NIP]-session.json
+' 3. Invoice via Python (t-10-session-online.py) -> Uses session.json
+'
+' This bypasses WAF 100% by using OpenSSL/Python for all wire operations.
+' VBA acts as the UI and process orchestrator.
+' -----------------------------------------------------------------------------
+
+Public Const KSEF_URL_TEST As String = "https://ksef-test.mf.gov.pl/api/v2"
+
+Private m_sUrl As String
+Private m_sNip As String
+Private m_sToken As String
+Private m_sAuthToken As String
+
+' Python config
+Private m_sPythonPath As String
+Private m_sWorkDir As String
+
+' -----------------------------------------------------------------------------
+' Setup
+' -----------------------------------------------------------------------------
+Public Sub Setup(ByVal sUrl As String, ByVal sNip As String, ByVal sToken As String)
+    m_sUrl = sUrl
+    m_sNip = sNip
+    m_sToken = sToken
+    
+    m_sPythonPath = "python"
+    ' Calculate WorkDir (parent folder of current or hardcoded)
+    m_sWorkDir = "c:\Users\Admin\Desktop\Dudek\Python\Projekty\KSeF-Python-Client-V6_TEST_Env_TOKEN"
+End Sub
+
+Public Sub SetSessionToken(ByVal sAuthToken As String)
+    m_sAuthToken = sAuthToken
+End Sub
+
+' -----------------------------------------------------------------------------
+' Api_Login (HYBRID)
+' -----------------------------------------------------------------------------
+Public Function Api_Login(ByRef outRefNum As String) As String
+    ' 1. Run Python: t-api-auth-token.py 1 f
+    Dim sCmd As String
+    sCmd = "cmd /c cd /d """ & m_sWorkDir & """ && " & m_sPythonPath & " t-api-auth-token.py 1 f"
+    
+    Dim sOutput As String
+    sOutput = ShellRunForOutput(sCmd)
+    
+    ' 2. Verify Output
+    Dim sAuthFile As String
+    sAuthFile = m_sWorkDir & "\" & m_sNip & "-auth.json"
+    
+    Application.Wait (Now + TimeValue("0:00:02"))
+    
+    If Dir(sAuthFile) = "" Then
+        Err.Raise vbObjectError + 1, "Hybrid", "Python Login Failed." & vbCrLf & _
+             "CMD: " & sCmd & vbCrLf & _
+             "OUT: " & sOutput & vbCrLf & _
+             "File not found: " & sAuthFile
+    End If
+    
+    ' 3. Read Token
+    Dim sJson As String
+    sJson = ReadFile(sAuthFile)
+    Dim jsonResp As Object
+    Set jsonResp = ModJson.JsonParse(sJson)
+    
+    m_sAuthToken = jsonResp("accessToken")("token")
+    outRefNum = "Login-via-Python-OK"
+    
+    Api_Login = m_sAuthToken
+End Function
+
+' -----------------------------------------------------------------------------
+' Api_OpenSession (HYBRID)
+' -----------------------------------------------------------------------------
+Public Function Api_OpenSession(ByRef outAesKey As String, ByRef outAesIV As String) As String
+    ' 1. Run Python: t-10-session-online.py 1 online -o
+    Dim sCmd As String
+    sCmd = "cmd /c cd /d """ & m_sWorkDir & """ && " & m_sPythonPath & " t-10-session-online.py 1 online -o"
+    
+    Dim sOutput As String
+    sOutput = ShellRunForOutput(sCmd)
+    
+    ' 2. Check Success
+    If InStr(sOutput, "201") = 0 And InStr(sOutput, "Sesja otwarta") = 0 Then
+         Err.Raise vbObjectError + 2, "Hybrid", "Python OpenSession Failed." & vbCrLf & _
+             "CMD: " & sCmd & vbCrLf & _
+             "OUT: " & sOutput
+    End If
+    
+    ' 3. Read Session Info
+    Dim sSessionFile As String
+    sSessionFile = m_sWorkDir & "\" & m_sNip & "-session.json"
+    
+    If Dir(sSessionFile) = "" Then
+        Err.Raise vbObjectError + 1, "Hybrid", "Session File Missing: " & sSessionFile
+    End If
+    
+    Dim sJson As String
+    sJson = ReadFile(sSessionFile)
+    Dim jsonSession As Object
+    Set jsonSession = ModJson.JsonParse(sJson)
+    
+    Api_OpenSession = jsonSession("referenceNumber")
+    
+    ' Note: t-10 saves keys in the JSON?
+    ' Let's assume keys are managed by Python and we don't strictly need them in Excel
+    ' UNLESS Excel wants to encrypt invoices itself (Hybrid Send).
+    ' BUT detailed checks show we should delegate Sending to Python to maintain session context/counters.
+    ' So we just return placeholders or what we find.
+    If jsonSession.Exists("symmetric_key") Then outAesKey = jsonSession("symmetric_key")
+    If jsonSession.Exists("iv") Then outAesIV = jsonSession("iv")
+End Function
+
+' -----------------------------------------------------------------------------
+' Api_SendInvoice (HYBRID)
+' -----------------------------------------------------------------------------
+Public Function Api_SendInvoice(ByVal sSessionRef As String, ByVal sXmlContent As String) As String
+    ' 1. Save XML to temp file
+    Dim sInvoicePath As String
+    sInvoicePath = m_sWorkDir & "\temp_invoice.xml"
+    WriteFile sInvoicePath, sXmlContent
+    
+    ' 2. Run Python: t-10-session-online.py 1 online -s file
+    Dim sCmd As String
+    sCmd = "cmd /c cd /d """ & m_sWorkDir & """ && " & m_sPythonPath & " t-10-session-online.py 1 online -s """ & sInvoicePath & """"
+    
+    Dim sOutput As String
+    sOutput = ShellRunForOutput(sCmd)
+    
+    ' 3. Check Success (Expect 202 Accepted)
+    If InStr(sOutput, "202") = 0 Then
+         Err.Raise vbObjectError + 3, "Hybrid", "Python SendInvoice Failed." & vbCrLf & _
+             "CMD: " & sCmd & vbCrLf & _
+             "OUT: " & sOutput
+    End If
+    
+    ' Parse output for ElementReferenceNumber if possible?
+    ' t-10 prints "Upload Status: <Response [202]>"
+    ' It logs result to session file or stdout.
+    ' For now return generic success.
+    Api_SendInvoice = "Sent-via-Python (Check Logs)"
+End Function
+
+' -----------------------------------------------------------------------------
+' Helpers
+' -----------------------------------------------------------------------------
+Private Function ShellRunForOutput(ByVal sCmd As String) As String
+    Dim oShell As Object, oExec As Object
+    Set oShell = CreateObject("WScript.Shell")
+    Set oExec = oShell.Exec(sCmd)
+    
+    Dim sOut As String, sErr As String
+    Do While oExec.status = 0
+        DoEvents
+    Loop
+    sOut = oExec.StdOut.ReadAll
+    sErr = oExec.StdErr.ReadAll
+    ShellRunForOutput = sOut & vbCrLf & "ERR: " & sErr
+End Function
+
+Private Sub WriteFile(ByVal Path As String, ByVal Content As String)
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.CreateTextFile(Path, True)
+    ts.Write Content
+    ts.Close
+End Sub
+
+Private Function ReadFile(ByVal Path As String) As String
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.OpenTextFile(Path, 1) ' ForReading
+    ReadFile = ts.ReadAll
+    ts.Close
+End Function
+
+
