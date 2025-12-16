@@ -1,0 +1,331 @@
+import sys
+import os
+import json
+import base64
+import datetime
+import dateutil.parser
+import requests
+
+# Ensure we can import from parent directory
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from cryptography.hazmat.primitives.asymmetric import padding as apadding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+
+# Import KSeF specific modules
+# We assume 'ksef' and 'ksefconfig' are available in the parent directory or bundled
+try:
+    from ksef import Client, AuthenticatedClient
+    from ksef.api.auth import (
+        post_api_v2_auth_challenge,
+        post_api_v2_auth_ksef_token,
+        get_api_v_2_auth_reference_number,
+        post_api_v2_auth_token_redeem
+    )
+    from ksef.models import (
+        init_token_authentication_request,
+        authentication_context_identifier,
+        authentication_context_identifier_type,
+    )
+    # We might need to implement Config manually to avoid dependency on command line args of ksefconfig
+except ImportError:
+    # Fallback for development if run from subfolder without proper pkg context
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from ksef import Client, AuthenticatedClient
+    from ksef.api.auth import (
+        post_api_v2_auth_challenge,
+        post_api_v2_auth_ksef_token,
+        get_api_v_2_auth_reference_number,
+        post_api_v2_auth_token_redeem
+    )
+    from ksef.models import (
+        init_token_authentication_request,
+        authentication_context_identifier,
+        authentication_context_identifier_type,
+    )
+
+# Hardcoded certificate for TEST env to avoid file dependency issues if possible, 
+# OR we load it from the bundled location.
+# For simplicity, we will attempt to load 'certificates-test.json' from the same dir or execution dir.
+
+def load_public_key(env='test'):
+    # In a real PyInstaller scenario, we need to locate the json file.
+    # For now, let's look in current dir or parent.
+    filename = 'certificates-test.json'
+    paths = [
+        filename,
+        os.path.join('..', filename),
+        os.path.join(getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))), filename)
+    ]
+    
+    cert_data = None
+    for p in paths:
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                cert_data = json.load(f)
+            break
+    
+    if not cert_data:
+        # Fallback: Try to fetch online if file not found? Or just fail.
+        # Let's try to fetch if missing (optional enhancement), but for now fail.
+        raise FileNotFoundError(f"Could not find {filename}")
+
+    # Parse first certificate
+    # Logic extracted from ksefconfig.py / ksefcert.py
+    # Assuming standard structure
+    # Based on ksefconfig.py, the json IS the list of keys.
+    if isinstance(cert_data, list):
+        keys = cert_data
+    else:
+        # Fallback if it is a dict with 'publicKeys'
+        keys = cert_data.get("publicKeys", [])
+    
+    # Sort or pick valid? implementation in ksefcert.py picks valid. 
+    # Simplified: pick the first one which is valid for encryption
+    
+    for key_info in keys:
+         if "KsefTokenEncryption" in key_info.get("usage", []):
+             cert_pem = key_info["certificate"]
+             break
+    else:
+        # Fallback to any if specific usage not found
+        if keys and len(keys) > 0:
+            cert_pem = keys[0]["certificate"]
+        else:
+             raise Exception("No public keys found in certificates file")
+
+    # Decode PEM
+    # The JSON usually has base64 DER or PEM body? 
+    # KSeF public keys in JSON are often Base64 DER or just Base64 of the cert content.
+    # Let's import x509
+    from cryptography import x509
+    
+    cert_bytes = base64.b64decode(cert_pem)
+    certificate = x509.load_der_x509_certificate(cert_bytes, default_backend())
+    public_key = certificate.public_key()
+    
+    return public_key
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: ksef_bridge.py <NIP> <TOKEN> <ENV> <OUTPUT_JSON>")
+        sys.exit(1)
+
+    nip = sys.argv[1]
+    token_val = sys.argv[2]
+    env = sys.argv[3].lower() # 'test' or 'prod'
+    output_file = sys.argv[4]
+
+    # Config
+    if env == 'prod':
+        base_url = "https://ksef.mf.gov.pl" # Verify prod url
+        raise NotImplementedError("Prod not fully configured in this bridge yet")
+    else:
+        base_url = "https://ksef-test.mf.gov.pl"
+    
+    client = Client(base_url)
+
+    try:
+        # 1. Authorisation Challenge
+        resp = post_api_v2_auth_challenge.sync(client=client)
+        if not resp:
+             raise Exception("Failed to get authorization challenge (None response)")
+        
+        try:
+            challenge_data = resp.to_dict()
+        except AttributeError:
+             # Maybe it's not a model but raw response or something else?
+             raise Exception(f"Response is not a model: {resp}")
+
+        print(f"DEBUG: challenge_data type: {type(challenge_data)}")
+        print(f"DEBUG: challenge_data content: {challenge_data}")
+
+        if isinstance(challenge_data, list):
+             # Try first element if it's a list (unexpected)
+             if len(challenge_data) > 0 and isinstance(challenge_data[0], dict):
+                  challenge_data = challenge_data[0]
+                  print("DEBUG: Using first element of list")
+
+        if 'timestamp' not in challenge_data:
+             raise Exception(f"Missing timestamp in challenge response. Got: {challenge_data}")
+
+        timestamp_str = challenge_data['timestamp']
+        challenge = challenge_data['challenge']
+
+        # 2. Encrypt Token
+        # Timestamp parsing
+        dt = dateutil.parser.isoparse(timestamp_str)
+        t_ms = int(dt.timestamp() * 1000)
+        
+        token_str = f"{token_val}|{t_ms}"
+        public_key = load_public_key(env)
+        
+        encrypted_token = public_key.encrypt(
+            token_str.encode('utf-8'),
+            apadding.OAEP(
+                mgf=apadding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        encrypted_b64 = base64.b64encode(encrypted_token).decode('utf-8')
+
+        # 3. Init Token Auth
+        body = init_token_authentication_request.InitTokenAuthenticationRequest(
+            challenge=challenge,
+            context_identifier=authentication_context_identifier.AuthenticationContextIdentifier(
+                type_=authentication_context_identifier_type.AuthenticationContextIdentifierType.NIP,
+                value=nip
+            ),
+            encrypted_token=encrypted_b64
+        )
+
+        auth_resp = post_api_v2_auth_ksef_token.sync(client=client, body=body)
+        if not auth_resp:
+             raise Exception("Failed to init token auth")
+        
+        auth_data = auth_resp.to_dict()
+        session_token = auth_data['authenticationToken']['token']
+        # referenceNumber is in the response too usually?
+        # Actually in the flow we might need to wait for status if it's async, 
+        # but InitToken usually returns the token immediately if successful or a reference to check.
+        # In t-api-auth-token.py:
+        # data2 = resp.to_dict() ... referenceNumber ... check status loop
+        
+        reference_number = auth_data['referenceNumber']
+        
+        # 4. Check Status Loop (Wait for 200)
+        # Using AuthenticatedClient now
+        auth_client = AuthenticatedClient(base_url, token=session_token)
+        
+        status_code = 100
+        retry_count = 0
+        while status_code < 200 and retry_count < 20:
+             status_resp = get_api_v_2_auth_reference_number.sync(client=auth_client, reference_number=reference_number)
+             status_data = status_resp.to_dict()
+             status_code = status_data['status']['code']
+             if status_code < 200:
+                 import time
+                 time.sleep(1)
+                 retry_count += 1
+        
+        if status_code != 200:
+            raise Exception(f"Authentication failed with status: {status_code}")
+
+        # 4.5. Redeem Token (Exchange Context Token for Access Token)
+        # The client 'auth_client' is already authenticated with the 'authenticationToken'.
+        # We need to call redeem to get the 'accessToken'.
+        
+        redeem_resp = post_api_v2_auth_token_redeem.sync(client=auth_client)
+        if not redeem_resp:
+             raise Exception("Failed to redeem token")
+        
+        try:
+             redeem_data = redeem_resp.to_dict()
+        except AttributeError:
+             # Check if it is a list or something else
+             print(f"DEBUG: Redeem response: {redeem_resp}")
+             # If generated client returns list for single object (bug?), handle it
+             if isinstance(redeem_resp, list) and len(redeem_resp) > 0: # Pure heuristic
+                 redeem_data = redeem_resp[0].to_dict() 
+             else:
+                 raise Exception(f"Redeem response is not a model: {redeem_resp}")
+        
+        # Depending on model structure, it is likely { "accessToken": { "token": "..." } }
+        # Let's handle potential list wrapper again just in case
+        if isinstance(redeem_data, list):
+             if len(redeem_data) > 0:
+                 redeem_data = redeem_data[0]
+
+        access_token_obj = redeem_data.get('accessToken')
+        # Sometimes structure is deeper or flattening?
+        # In t-api-auth-token, data4 = resp.to_dict().
+        # t-10 access_token = data4["accessToken"]["token"].
+        
+        if not access_token_obj or 'token' not in access_token_obj:
+             print(f"DEBUG: Redeem Data Content: {redeem_data}")
+             raise Exception("Missing accessToken in redeem response")
+        
+        final_access_token = access_token_obj['token']
+
+        # 5. Open Session (Online)
+        # Use the FINAL ACCESS TOKEN
+        
+        # We need to Generate AES key and IV
+        sym_key_bytes = os.urandom(32)
+        iv_bytes = os.urandom(16)
+        
+        # Encrypt Sym Key with Public Key
+        encrypted_sym_key = public_key.encrypt(
+            sym_key_bytes,
+            apadding.OAEP(
+                mgf=apadding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            )
+        )
+        
+        # Online Session Init
+        req_data = {
+            "formCode": {
+                "systemCode": "FA (3)", 
+                "schemaVersion": "1-0E",
+                "value": "FA",
+            },
+            "encryption": {
+                "encryptedSymmetricKey": base64.b64encode(encrypted_sym_key).decode('utf-8'),
+                "initializationVector": base64.b64encode(iv_bytes).decode('utf-8'),
+            },
+        }
+
+        # Session Init Endpoint
+        session_resp = requests.post(
+             f"{base_url}/api/v2/sessions/online", 
+            json=req_data,
+            headers={
+                "Authorization": f"Bearer {final_access_token}",
+                "Content-Type": "application/json" 
+            },
+            timeout=30
+        )
+        
+        if session_resp.status_code != 201:
+             # Try /api/online/Session... if v2 fails? No, stick to v2 as per user context.
+             pass
+
+        if session_resp.status_code != 201:
+             raise Exception(f"Session Open Failed: {session_resp.status_code} {session_resp.text}")
+
+        session_resp_data = session_resp.json()
+        session_ref_number = session_resp_data['referenceNumber']
+        
+        # Output Result
+        result = {
+            "status": "OK",
+            "sessionToken": session_token,
+            "sessionReferenceNumber": session_ref_number,
+            "aesKey": base64.b64encode(sym_key_bytes).decode('utf-8'),
+            "aesIV": base64.b64encode(iv_bytes).decode('utf-8'),
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        with open(output_file, 'w') as f:
+            json.dump(result, f, indent=4)
+        
+        print(f"Success. Data written to {output_file}")
+
+    except Exception as e:
+        err_result = {
+            "status": "ERROR",
+            "message": str(e)
+        }
+        with open(output_file, 'w') as f:
+            json.dump(err_result, f, indent=4)
+        print(f"Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

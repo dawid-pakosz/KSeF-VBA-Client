@@ -1,0 +1,132 @@
+
+Option Explicit
+
+' Using Windows Crypto API for reliable Base64 performance
+Private Const CRYPT_STRING_BASE64 As Long = 1
+Private Const CRYPT_STRING_NOCRLF As Long = &H40000000
+
+#If VBA7 Then
+    Private Declare PtrSafe Function CryptBinaryToString Lib "crypt32.dll" Alias "CryptBinaryToStringW" ( _
+        ByRef pbBinary As Any, _
+        ByVal cbBinary As Long, _
+        ByVal dwFlags As Long, _
+        ByVal pszString As LongPtr, _
+        ByRef pcchString As Long) As Long
+        
+    Private Declare PtrSafe Function CryptStringToBinary Lib "crypt32.dll" Alias "CryptStringToBinaryW" ( _
+        ByVal pszString As LongPtr, _
+        ByVal cchString As Long, _
+        ByVal dwFlags As Long, _
+        ByRef pbBinary As Any, _
+        ByRef cbBinary As Long, _
+        ByRef pdwSkip As Long, _
+        ByRef pdwFlags As Long) As Long
+#Else
+    Private Declare Function CryptBinaryToString Lib "crypt32.dll" Alias "CryptBinaryToStringW" ( _
+        ByRef pbBinary As Any, _
+        ByVal cbBinary As Long, _
+        ByVal dwFlags As Long, _
+        ByVal pszString As Long, _
+        ByRef pcchString As Long) As Long
+        
+    Private Declare Function CryptStringToBinary Lib "crypt32.dll" Alias "CryptStringToBinaryW" ( _
+        ByVal pszString As Long, _
+        ByVal cchString As Long, _
+        ByVal dwFlags As Long, _
+        ByRef pbBinary As Any, _
+        ByRef cbBinary As Long, _
+        ByRef pdwSkip As Long, _
+        ByRef pdwFlags As Long) As Long
+#End If
+
+' -----------------------------------------------------------------------------
+' EncodeByteToString
+' Encodes a Byte array to a Base64 string (no line breaks).
+' -----------------------------------------------------------------------------
+Public Function EncodeByteToString(ByRef abData() As Byte) As String
+    Dim lLen As Long
+    Dim sBuf As String
+    Dim lRet As Long
+    
+    ' Determine length
+    lRet = CryptBinaryToString(abData(0), UBound(abData) - LBound(abData) + 1, _
+                               CRYPT_STRING_BASE64 Or CRYPT_STRING_NOCRLF, 0, lLen)
+    If lRet = 0 Then Exit Function
+    
+    sBuf = String$(lLen - 1, 0)
+    lRet = CryptBinaryToString(abData(0), UBound(abData) - LBound(abData) + 1, _
+                               CRYPT_STRING_BASE64 Or CRYPT_STRING_NOCRLF, StrPtr(sBuf), lLen)
+    
+    EncodeByteToString = sBuf
+End Function
+
+' -----------------------------------------------------------------------------
+' DecodeStringToByte
+' Decodes a Base64 string to a Byte array.
+' -----------------------------------------------------------------------------
+Public Function DecodeStringToByte(ByVal sStr As String) As Byte()
+    Dim lLen As Long
+    Dim abBuf() As Byte
+    Dim lRet As Long
+    Dim lSkip As Long, lFlags As Long
+    
+    ' Determine length
+    lRet = CryptStringToBinary(StrPtr(sStr), Len(sStr), _
+                               CRYPT_STRING_BASE64, ByVal 0&, lLen, lSkip, lFlags)
+    If lRet = 0 Then Exit Function
+    
+    ReDim abBuf(0 To lLen - 1)
+    lRet = CryptStringToBinary(StrPtr(sStr), Len(sStr), _
+                               CRYPT_STRING_BASE64, abBuf(0), lLen, lSkip, lFlags)
+    
+    DecodeStringToByte = abBuf
+End Function
+
+' -----------------------------------------------------------------------------
+' EncodeStringToString
+' Helper: Encodes a standard string (UTF-8 bytes) to Base64 string
+' -----------------------------------------------------------------------------
+Public Function EncodeStringToString(ByVal sText As String) As String
+    Dim enc() As Byte
+    ' Simple ASCII/Ansi conversion. For UTF-8 specific handling, ADODB.Stream is often better
+    ' but for Token which is usually simple chars, StrConv is acceptable or direct byte copy.
+    ' Ideally we want UTF-8 bytes for JSON content.
+    enc = StrConv(sText, vbFromUnicode)
+    EncodeStringToString = EncodeByteToString(enc)
+End Function
+
+' Helper to get UTF8 Bytes from String
+Public Function Utf8BytesFromString(ByVal sText As String) As Byte()
+    Dim objStream As Object
+    Set objStream = CreateObject("ADODB.Stream")
+    objStream.Type = 2 ' adTypeText
+    objStream.Charset = "utf-8"
+    objStream.Open
+    objStream.WriteText sText
+    
+    objStream.Position = 0
+    objStream.Type = 1 ' adTypeBinary
+    
+    ' Skip BOM if present? ADODB.Stream usually adds BOM
+    Dim b() As Byte
+    b = objStream.Read
+    objStream.Close
+    
+    ' Remove BOM (EF BB BF) if present
+    Dim i As Long
+    If UBound(b) >= 2 Then
+       If b(0) = &HEF And b(1) = &HBB And b(2) = &HBF Then
+           Dim b2() As Byte
+           ReDim b2(0 To UBound(b) - 3)
+           For i = 0 To UBound(b2)
+               b2(i) = b(i + 3)
+           Next i
+           Utf8BytesFromString = b2
+           Exit Function
+       End If
+    End If
+    
+    Utf8BytesFromString = b
+End Function
+
+

@@ -1,0 +1,93 @@
+
+Option Explicit
+
+' -----------------------------------------------------------------------------
+' Python Bridge Integration
+' -----------------------------------------------------------------------------
+
+Public Function AuthWithExe(ByVal sNip As String, ByVal sToken As String, ByVal sEnv As String) As Object
+    On Error GoTo ErrorHandler
+    
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    ' 1. Define Paths
+    ' Assumes EXE is in the same folder as the Workbook (or specific path)
+    ' For this test, we hardcode or pick relative.
+    ' In VBA, ActiveWorkbook.Path usually works if saved.
+    
+    Dim sExePath As String
+    sExePath = ActiveWorkbook.path & "\dist\ksef_auth_bridge.exe" ' Adjust if needed
+    
+    ' Check if Exe exists
+    If Not fso.FileExists(sExePath) Then
+        ' Fallback to known path for dev
+        sExePath = ActiveWorkbook.path & "\ksef_auth_bridge.exe"
+        If Not fso.FileExists(sExePath) Then
+             Err.Raise 9999, "AuthWithExe", "EXE not found at: " & sExePath
+        End If
+    End If
+    
+    Dim sOutputPath As String
+    sOutputPath = ActiveWorkbook.path & "\bridge_output.json"
+    
+    ' 2. Build Command
+    ' ksef_auth_bridge.exe <NIP> <TOKEN> <ENV> <OUTPUT>
+    Dim sCmd As String
+    sCmd = """" & sExePath & """ " & _
+           sNip & " " & _
+           """" & sToken & """ " & _
+           sEnv & " " & _
+           """" & sOutputPath & """"
+           
+    ' 3. Execute (Hidden, Wait)
+    Dim wsh As Object
+    Set wsh = CreateObject("WScript.Shell")
+    
+    Dim iRet As Integer
+    ' 0 = Hide Window, True = Wait
+    iRet = wsh.Run(sCmd, 0, True)
+    
+    If iRet <> 0 Then
+        Err.Raise 9999, "AuthWithExe", "EXE returned error code: " & iRet
+    End If
+    
+    ' 4. Read Output
+    If Not fso.FileExists(sOutputPath) Then
+        Err.Raise 9999, "AuthWithExe", "Output JSON not found."
+    End If
+    
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(sOutputPath, 1) ' ForReading
+    Dim sJson As String
+    sJson = ts.ReadAll
+    ts.Close
+    
+    ' 5. Parse JSON
+    ' Uses ModJson (assumed available)
+    Dim dic As Object
+    Set dic = ModJson.JsonParse(sJson) 'ModJson.ParseJson(sJson)
+            
+    
+    If dic("status") <> "OK" Then
+        Dim sMsg As String
+        sMsg = "Bridge Error: " & dic("message")
+        Err.Raise 9999, "AuthWithExe", sMsg
+    End If
+    
+    Set AuthWithExe = dic
+    Exit Function
+    
+ErrorHandler:
+    Dim errDesc As String
+    errDesc = Err.Description
+    On Error Resume Next
+    ' Cleanup
+    If Not fso Is Nothing Then
+        'If fso.FileExists(sOutputPath) Then fso.DeleteFile sOutputPath
+    End If
+    On Error GoTo 0
+    Err.Raise 9999, "AuthWithExe", "Failed: " & errDesc
+End Function
+
+

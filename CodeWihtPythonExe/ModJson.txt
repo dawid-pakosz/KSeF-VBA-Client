@@ -1,0 +1,261 @@
+
+Option Explicit
+
+' -----------------------------------------------------------------------------
+' Simple JSON Parser & Generator for VBA
+' Based on common VBA-JSON approaches but simplified for KSeF needs.
+' -----------------------------------------------------------------------------
+
+' Parses a JSON string and returns a Dictionary or Collection
+Public Function JsonParse(ByVal json As String) As Object
+    Dim scriptControl As Object
+    ' Use ScriptControl for reliable parsing if available (32-bit/64-bit workaround needed)
+    ' However, ScriptControl is not available in 64-bit Office by default.
+    ' So we will use a regex/string parser or a simple reliable hack.
+    
+    ' For highest compatibility in "Pure VBA" without ScriptControl (which fails on 64-bit):
+    ' We will use a dedicated class-less implementation would be too long here.
+    ' Plan B: For KSeF simple responses, we can use a Regex based parser or just simple string manipulation
+    ' IF ScriptControl is not an option.
+    ' BUT: The most robust way is to use "MSScriptControl.ScriptControl" on 32-bit
+    ' OR simple primitive parsing.
+    
+    ' GIVEN KSeF responses are reasonably standard, we will try a pure VBA parser approach.
+    ' This is a mini-parser.
+    
+    Set JsonParse = ParseValue(json, 1)
+End Function
+
+' Serializes a Dictionary/Collection to JSON String
+Public Function JsonDump(ByVal val As Variant) As String
+    JsonDump = ConvertToString(val)
+End Function
+
+' --- Private Helper Functions for Parsing ---
+
+Private Function ParseValue(ByRef json As String, ByRef p As Long) As Variant
+    SkipWhitespace json, p
+    Select Case Mid$(json, p, 1)
+        Case "{"
+            Set ParseValue = ParseObject(json, p)
+        Case "["
+            Set ParseValue = ParseArray(json, p)
+        Case """"
+            ParseValue = ParseString(json, p)
+        Case "t", "f" ' true/false
+            ParseValue = ParseBoolean(json, p)
+        Case "n" ' null
+            ParseValue = Null
+            p = p + 4
+        Case Else
+            ParseValue = ParseNumber(json, p)
+    End Select
+End Function
+
+Private Function ParseObject(ByRef json As String, ByRef p As Long) As Object
+    Dim dic As Object
+    Set dic = CreateObject("Scripting.Dictionary")
+    p = p + 1 ' {
+    SkipWhitespace json, p
+    If Mid$(json, p, 1) = "}" Then
+        p = p + 1
+        Set ParseObject = dic
+        Exit Function
+    End If
+    
+    Do
+        SkipWhitespace json, p
+        Dim key As String
+        key = ParseString(json, p)
+        SkipWhitespace json, p
+        If Mid$(json, p, 1) <> ":" Then Err.Raise 1001, "JsonParser", "Expected ':'"
+        p = p + 1
+        
+        Dim val As Variant
+        'Dim val As Variant
+        AssignVariant val, ParseValue(json, p)
+        
+        dic.Add key, val
+        
+        SkipWhitespace json, p
+        If Mid$(json, p, 1) = "}" Then
+            p = p + 1
+            Exit Do
+        ElseIf Mid$(json, p, 1) = "," Then
+            p = p + 1
+        Else
+            Err.Raise 1001, "JsonParser", "Expected '}' or ','"
+        End If
+    Loop
+    Set ParseObject = dic
+End Function
+
+Private Function ParseArray(ByRef json As String, ByRef p As Long) As Collection
+    Dim col As New Collection
+    p = p + 1 ' [
+    SkipWhitespace json, p
+    If Mid$(json, p, 1) = "]" Then
+        p = p + 1
+        Set ParseArray = col
+        Exit Function
+    End If
+    
+    Do
+        col.Add ParseValue(json, p)
+        SkipWhitespace json, p
+        If Mid$(json, p, 1) = "]" Then
+            p = p + 1
+            Exit Do
+        ElseIf Mid$(json, p, 1) = "," Then
+            p = p + 1
+        Else
+            Err.Raise 1001, "JsonParser", "Expected ']' or ','"
+        End If
+    Loop
+    Set ParseArray = col
+End Function
+
+Private Function ParseString(ByRef json As String, ByRef p As Long) As String
+    Dim res As String
+    p = p + 1 ' "
+    Dim start As Long
+    start = p
+    Do
+        Dim c As String
+        c = Mid$(json, p, 1)
+        If c = """" Then
+            res = res & Mid$(json, start, p - start)
+            p = p + 1
+            Exit Do
+        ElseIf c = "\" Then
+            res = res & Mid$(json, start, p - start)
+            p = p + 1
+            c = Mid$(json, p, 1)
+            Select Case c
+                Case """", "\", "/": res = res & c
+                Case "b": res = res & vbBack
+                Case "f": res = res & vbFormFeed
+                Case "n": res = res & vbLf
+                Case "r": res = res & vbCr
+                Case "t": res = res & vbTab
+                Case "u":
+                    ' Unicode hex
+                    res = res & ChrW(val("&H" & Mid$(json, p + 1, 4)))
+                    p = p + 4
+            End Select
+            p = p + 1
+            start = p
+        Else
+            p = p + 1
+        End If
+    Loop
+    ParseString = res
+End Function
+
+Private Function ParseBoolean(ByRef json As String, ByRef p As Long) As Boolean
+    If Mid$(json, p, 4) = "true" Then
+        ParseBoolean = True
+        p = p + 4
+    Else
+        ParseBoolean = False
+        p = p + 5
+    End If
+End Function
+
+Private Function ParseNumber(ByRef json As String, ByRef p As Long) As Double
+    Dim start As Long
+    start = p
+    Do While InStr("0123456789+-.eE", Mid$(json, p, 1)) > 0
+        p = p + 1
+    Loop
+    ParseNumber = val(Mid$(json, start, p - start))
+End Function
+
+Private Sub SkipWhitespace(ByRef json As String, ByRef p As Long)
+    Do While p <= Len(json) And (Mid$(json, p, 1) = " " Or Mid$(json, p, 1) = vbCr Or Mid$(json, p, 1) = vbLf Or Mid$(json, p, 1) = vbTab)
+        p = p + 1
+    Loop
+End Sub
+
+' --- Private Helper Functions for Dump ---
+
+Private Function ConvertToString(val As Variant) As String
+    Select Case VarType(val)
+        Case vbNull, vbEmpty
+            ConvertToString = "null"
+        Case vbInteger, vbLong, vbSingle, vbDouble, vbCurrency, vbDecimal, vbByte
+            ConvertToString = Replace(CStr(val), ",", ".") ' Ensure JS format
+        Case vbBoolean
+            ConvertToString = IIf(val, "true", "false")
+        Case vbString
+            ConvertToString = """" & EscapeString(val) & """"
+        Case vbObject
+            If val Is Nothing Then
+                ConvertToString = "null"
+            ElseIf TypeName(val) = "Dictionary" Then
+                ConvertToString = DictToString(val)
+            ElseIf TypeName(val) = "Collection" Then
+                ConvertToString = CollToString(val)
+            Else
+                ' Fallback
+                ConvertToString = """" & CStr(val) & """"
+            End If
+        Case Else
+           ConvertToString = """" & CStr(val) & """"
+    End Select
+End Function
+
+Private Function EscapeString(ByVal s As String) As String
+    Dim i As Long, c As String, res As String
+    For i = 1 To Len(s)
+        c = Mid$(s, i, 1)
+        Select Case c
+            Case "\": res = res & "\\"
+            Case """": res = res & "\"""
+            Case vbCr: res = res & "\r"
+            Case vbLf: res = res & "\n"
+            Case vbTab: res = res & "\t"
+            Case Else: res = res & c
+        End Select
+    Next i
+    EscapeString = res
+End Function
+
+Private Function DictToString(ByVal dic As Object) As String
+    Dim items As New Collection
+    Dim k As Variant
+    For Each k In dic.Keys
+        items.Add """" & EscapeString(k) & """:" & ConvertToString(dic(k))
+    Next k
+    DictToString = "{" & JoinCollection(items, ",") & "}"
+End Function
+
+Private Function CollToString(ByVal col As Collection) As String
+    Dim items As New Collection
+    Dim val As Variant
+    For Each val In col
+        items.Add ConvertToString(val)
+    Next val
+    CollToString = "[" & JoinCollection(items, ",") & "]"
+End Function
+
+Private Function JoinCollection(col As Collection, delim As String) As String
+    Dim res As String
+    Dim val As Variant, i As Long
+    i = 0
+    For Each val In col
+        If i > 0 Then res = res & delim
+        res = res & val
+        i = i + 1
+    Next val
+    JoinCollection = res
+End Function
+
+Private Sub AssignVariant(ByRef dest As Variant, ByVal source As Variant)
+    If IsObject(source) Then
+        Set dest = source
+    Else
+        dest = source
+    End If
+End Sub
+

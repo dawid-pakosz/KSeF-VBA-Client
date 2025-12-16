@@ -1,0 +1,19 @@
+# Build KSeF Bridge EXE
+# Run this from the project root directory!
+
+python -m PyInstaller --noconfirm --onefile --clean `
+    --name ksef_auth_bridge `
+    --add-data "certificates-test.json;." `
+    --paths "." `
+    --hidden-import "ksef" `
+    --hidden-import "ksef.api.auth" `
+    --hidden-import "ksef.models" `
+    --collect-all "ksef" `
+    VBA_Client_With_PyInstaller/ksef_bridge.py
+
+# Check if build succeeded
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Build Successful! EXE is in dist/ksef_auth_bridge.exe"
+} else {
+    Write-Host "Build Failed!"
+}
